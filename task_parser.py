@@ -1,67 +1,53 @@
-import re
+import os
+import json
+from google import genai
+from dotenv import load_dotenv
 from gmail_reader import get_emails
 
-DEADLINE_KEYWORDS = [
-    'deadline', 'due', 'הגשה', 'מועד אחרון',
-    'יש להגיש', 'תאריך הגשה', 'מטלה', 'assignment'
-]
+load_dotenv()
+
+client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
 
 IGNORE_KEYWORDS = [
     'you have submitted',
     'your submission',
-    'הגשתך התקבלה',
     'submission received',
     'you submitted',
 ]
 
-# מילות מפתח לזיהוי דחייה
-POSTPONE_KEYWORDS = [
-    'דחייה', 'נדחה', 'נדחית', 'תאריך חדש', 'מועד חדש',
-    'extended', 'postponed', 'new deadline', 'new due date',
-    'הוארך', 'דחינו', 'דוחים'
-]
 
-DATE_PATTERNS = [
-    r'\d{1,2}\.\d{1,2}(?:\.\d{2,4})?',
-    r'\d{1,2}/\d{1,2}(?:/\d{2,4})?',
-    r'\d{4}-\d{2}-\d{2}',
-    r'\d{1,2} (?:ינואר|פברואר|מרץ|אפריל|מאי|יוני|יולי|אוגוסט|ספטמבר|אוקטובר|נובמבר|דצמבר)',
-    r'\d{1,2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*',
-]
+def analyze_email_with_gemini(subject, body):
+    prompt = f"""
+You are analyzing a university email. Extract assignment information.
 
-DEADLINE_SENTENCE_PATTERNS = [
-    r'תאריך ההגשה[^\n.]*?(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
-    r'יש להגיש[^\n.]*?(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
-    r'מועד אחרון[^\n.]*?(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
-    r'due[^\n.]*?(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
-    r'deadline[^\n.]*?(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
-    r'נדח[^\n.]*?(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
-    r'תאריך חדש[^\n.]*?(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
-    r'מועד חדש[^\n.]*?(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
-    r'extended[^\n.]*?(\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?)',
-]
+Subject: {subject}
+Body: {body[:500]}
 
+Reply with ONLY a JSON object in this exact format, nothing else:
+{{
+    "is_assignment": true or false,
+    "is_postponement": true or false,
+    "deadline_date": "DD.MM.YYYY or null",
+    "assignment_name": "name or null"
+}}
 
-def extract_deadline_dates(body):
-    deadlines = []
-    for pattern in DEADLINE_SENTENCE_PATTERNS:
-        matches = re.findall(pattern, body, re.IGNORECASE)
-        deadlines.extend(matches)
-    return list(set(deadlines))
-
-
-def is_postponement(subject, body):
-    """בודק אם המייל הוא הודעת דחייה"""
-    text = f"{subject} {body}".lower()
-    return any(kw.lower() in text for kw in POSTPONE_KEYWORDS)
-
-
-def extract_course_name(subject):
-    """מחלץ שם קורס מנושא המייל"""
-    # נושא BGU בפורמט: "שם קורס: נושא הודעה"
-    if ':' in subject:
-        return subject.split(':')[0].strip()
-    return subject.strip()
+Rules:
+- is_assignment: true if this email is about an assignment deadline
+- is_postponement: true if a deadline was moved to a new date
+- deadline_date: the submission date in DD.MM.YYYY format, null if not found
+- assignment_name: the assignment name, null if not found
+"""
+    try:
+        response = client.models.generate_content(
+            model='gemini-2.0-flash',
+            contents=prompt
+        )
+        text = response.text.strip()
+        text = text.replace('```json', '').replace('```', '').strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"  Gemini error: {e}")
+        return None
 
 
 def extract_tasks_from_email(subject, body=''):
@@ -72,24 +58,21 @@ def extract_tasks_from_email(subject, body=''):
     if is_confirmation:
         return tasks
 
-    has_keyword = any(kw.lower() in text for kw in DEADLINE_KEYWORDS)
-    if not has_keyword:
+    print(f"  Gemini analyzing: {subject[:50]}...")
+    result = analyze_email_with_gemini(subject, body)
+
+    if not result or not result.get('is_assignment'):
         return tasks
 
-    deadline_dates = extract_deadline_dates(body)
-
-    if not deadline_dates:
-        for pattern in DATE_PATTERNS:
-            matches = re.findall(pattern, subject, re.IGNORECASE)
-            deadline_dates.extend(matches)
+    deadline = result.get('deadline_date')
 
     task = {
         'title': subject,
-        'course': extract_course_name(subject),
+        'course': subject.split(':')[0].strip() if ':' in subject else subject,
         'body': body,
-        'dates_found': deadline_dates,
-        'has_deadline': len(deadline_dates) > 0,
-        'is_postponement': is_postponement(subject, body)
+        'dates_found': [deadline] if deadline else [],
+        'has_deadline': deadline is not None,
+        'is_postponement': result.get('is_postponement', False)
     }
     tasks.append(task)
     return tasks
@@ -105,20 +88,20 @@ def parse_all_emails(emails):
         )
         if tasks:
             for task in tasks:
-                tag = "🔄 דחייה" if task['is_postponement'] else "✅ משימה"
-                print(f"{tag}: {task['title'][:60]}...")
+                tag = "Postponement" if task['is_postponement'] else "Assignment"
+                print(f"  [{tag}] {task['title'][:60]}")
                 if task['dates_found']:
-                    print(f"   📅 תאריך: {task['dates_found']}")
+                    print(f"    Deadline: {task['dates_found']}")
                 else:
-                    print(f"   ⚠️  לא נמצא תאריך")
+                    print(f"    No date found")
             all_tasks.extend(tasks)
 
-    print(f"\nסה\"כ {len(all_tasks)} משימות זוהו")
+    print(f"\nTotal: {len(all_tasks)} tasks found")
     return all_tasks
 
 
 if __name__ == '__main__':
-    print("שולף מיילים...")
+    print("Fetching emails...")
     emails = get_emails()
-    print("\nמנתח משימות...\n")
+    print("\nAnalyzing with Gemini AI...\n")
     tasks = parse_all_emails(emails)
